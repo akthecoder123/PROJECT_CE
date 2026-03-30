@@ -1,0 +1,38 @@
+# .gitignore — Files Git should NEVER track or push to GitHub
+
+# ── Secrets (CRITICAL — never commit these!) ─────────────────
+.env
+*.env
+
+# ── Python generated files ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# ── Virtual environment ───────────────────────────────────────
+venv/
+env/
+.venv/
+ENV/
+
+# ── OS generated files ────────────────────────────────────────
+.DS_Store       # macOS
+Thumbs.db       # Windows
+desktop.ini
+
+# ── Editor settings ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Distribution / packaging ──────────────────────────────────
+dist/
+build/
+*.egg-info/
