@@ -36,3 +36,10 @@ logs/
 dist/
 build/
 *.egg-info/
+
+#ignore this:
+*tempCodeRunnerFile.python
+pdfs/
+
+
+
