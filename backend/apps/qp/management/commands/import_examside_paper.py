@@ -1,3 +1,5 @@
+"""Django command for importing one Examside paper by URL."""
+
 from django.core.management.base import BaseCommand, CommandError
 
 from apps.qp.services.examside_importer import replace_paper_questions
@@ -7,16 +9,21 @@ class Command(BaseCommand):
     help = "Import one Examside paper into the Question table."
 
     def add_arguments(self, parser):
+        # The user passes the target Examside paper URL on the command line.
         parser.add_argument("paper_url", help="Paper page URL or paper __data.json URL.")
 
     def handle(self, *args, **options):
+        # Django collects command-line arguments into ``options``.
         paper_url = options["paper_url"]
 
         try:
+            # The service does all the heavy lifting: fetch, parse, enrich, save.
             result = replace_paper_questions(paper_url)
         except Exception as exc:
+            # Re-raise as CommandError so Django prints a clean CLI error message.
             raise CommandError(str(exc)) from exc
 
+        # Show a short success summary after the import finishes.
         self.stdout.write(
             self.style.SUCCESS(
                 f"Imported {result['count']} questions for "

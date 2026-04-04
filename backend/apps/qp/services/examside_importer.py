@@ -1,3 +1,14 @@
+"""Helpers for importing one Examside paper into the Question table.
+
+High-level flow:
+1. Download the paper-level ``__data.json`` file from Examside.
+2. Read the paper metadata and the base question list from that payload.
+3. Visit one question-details endpoint per Examside batch to fetch options,
+   correct answers, chapters, and explanations.
+4. Replace any existing rows for the same exam/date/shift combination.
+5. Bulk insert the fresh question rows into the database.
+"""
+
 import json
 from html.parser import HTMLParser
 from dataclasses import dataclass
@@ -17,11 +28,14 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
+# Keep a local copy of the raw Examside response for debugging and inspection.
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 
 @dataclass(frozen=True)
 class PaperMetadata:
+    """Normalized paper fields that we later copy onto each Question row."""
+
     paper_key: str
     paper_title: str
     exam_date: date | None
@@ -30,6 +44,8 @@ class PaperMetadata:
 
 
 class ImageUrlParser(HTMLParser):
+    """Collect every ``img`` URL from an HTML snippet."""
+
     def __init__(self) -> None:
         super().__init__()
         self.urls: list[str] = []
@@ -45,6 +61,8 @@ class ImageUrlParser(HTMLParser):
 
 
 def normalize_paper_url(paper_url: str) -> str:
+    """Accept either a paper page URL or a ``/__data.json`` URL and normalize it."""
+
     clean_url = paper_url.strip().rstrip("/")
     if clean_url.endswith("/__data.json"):
         clean_url = clean_url[: -len("/__data.json")]
@@ -52,6 +70,8 @@ def normalize_paper_url(paper_url: str) -> str:
 
 
 def build_headers(referer: str) -> dict[str, str]:
+    """Send browser-like headers so Examside accepts the request."""
+
     return {
         "User-Agent": USER_AGENT,
         "Accept": "application/json,text/plain,*/*",
@@ -60,6 +80,8 @@ def build_headers(referer: str) -> dict[str, str]:
 
 
 def fetch_json(url: str, referer: str) -> dict[str, Any]:
+    """Fetch JSON from Examside and raise a clearer error if the request fails."""
+
     request = Request(url, headers=build_headers(referer))
     try:
         with urlopen(request, timeout=30) as response:
@@ -71,22 +93,35 @@ def fetch_json(url: str, referer: str) -> dict[str, Any]:
 
 
 def write_raw_snapshot(name: str, payload: dict[str, Any]) -> None:
+    """Write a prettified copy of the payload so we can inspect site changes later."""
+
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     target = RAW_DIR / name
     target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def resolve(data: list[Any], value: Any) -> Any:
+    """Resolve Examside's indexed references back into the actual object.
+
+    In this payload format, many fields are stored as integers that point into
+    a shared ``data`` list. If the value is already a real object/string/list,
+    we return it unchanged.
+    """
+
     if isinstance(value, int):
         return data[value]
     return value
 
 
 def resolve_field(data: list[Any], obj: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Read ``obj[key]`` and resolve it if it is stored as a numeric reference."""
+
     return resolve(data, obj.get(key, default))
 
 
 def find_node(root: dict[str, Any], params: list[str]) -> dict[str, Any]:
+    """Pick the route node whose parameter signature matches the page we need."""
+
     for node in root.get("nodes", []):
         uses = node.get("uses", {})
         if isinstance(uses, dict) and uses.get("params") == params:
@@ -95,12 +130,21 @@ def find_node(root: dict[str, Any], params: list[str]) -> dict[str, Any]:
 
 
 def parse_exam_date(raw_value: str | None) -> date | None:
+    """Convert the Examside ISO datetime string into a Python ``date``."""
+
     if not raw_value:
         return None
     return date.fromisoformat(raw_value[:10])
 
 
 def parse_shift(title: str) -> int:
+    """Infer shift from the title.
+
+    Current assumption:
+    - titles containing ``evening`` are shift 2
+    - everything else is treated as shift 1
+    """
+
     lowered = title.lower()
     if "evening" in lowered:
         return 2
@@ -108,17 +152,23 @@ def parse_shift(title: str) -> int:
 
 
 def slug_to_title(value: str | None) -> str:
+    """Turn values like ``mathematics`` or ``coordinate-geometry`` into display text."""
+
     if not value:
         return ""
     return value.replace("-", " ").strip().title()
 
 
 def extract_paper_key(paper_url: str) -> str:
+    """Extract the last URL segment, which is usually the paper slug/key."""
+
     path = urlparse(paper_url).path.rstrip("/")
     return path.split("/")[-1]
 
 
 def extract_image_urls(html: str) -> list[str]:
+    """Return unique image URLs from an HTML fragment while preserving order."""
+
     if not html:
         return []
 
@@ -128,6 +178,7 @@ def extract_image_urls(html: str) -> list[str]:
     unique_urls: list[str] = []
     seen: set[str] = set()
     for url in parser.urls:
+        # Examside can repeat the same image in the HTML, so we de-duplicate it.
         if url not in seen:
             seen.add(url)
             unique_urls.append(url)
@@ -135,11 +186,20 @@ def extract_image_urls(html: str) -> list[str]:
 
 
 def extract_paper_questions(paper_url: str) -> tuple[PaperMetadata, list[dict[str, Any]]]:
+    """Read the paper page and extract metadata plus the base question list.
+
+    This first pass gives us the paper title/date/shift and the main question
+    HTML for each section. It does not include full option/explanation details
+    yet; that enrichment happens in a later step.
+    """
+
     page_url = normalize_paper_url(paper_url)
     data_url = f"{page_url}/__data.json"
     root = fetch_json(data_url, referer=page_url)
     write_raw_snapshot("examside_paper_response.json", root)
 
+    # The paper overview lives under the route:
+    # /examGroup/exam/paper
     node = find_node(root, ["examGroup", "exam", "paper"])
     data = node["data"]
     top = data[0]
@@ -165,6 +225,7 @@ def extract_paper_questions(paper_url: str) -> tuple[PaperMetadata, list[dict[st
             question_html = resolve_field(data, question, "content", "") or ""
             questions.append(
                 {
+                    # ``question_id`` is reused later to fetch the details page.
                     "question_id": str(question_id),
                     "subject": subject,
                     "question_text": question_html,
@@ -176,11 +237,15 @@ def extract_paper_questions(paper_url: str) -> tuple[PaperMetadata, list[dict[st
 
 
 def build_question_details_url(paper_url: str, question_id: str) -> str:
+    """Build the Examside details endpoint for a specific question."""
+
     page_url = normalize_paper_url(paper_url)
     return f"{page_url}/{question_id}/__data.json"
 
 
 def resolve_options(data: list[Any], english_block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract rendered option HTML plus image URLs from the English block."""
+
     raw_options = resolve(data, english_block.get("options", []))
     if not isinstance(raw_options, list):
         return []
@@ -201,6 +266,12 @@ def resolve_options(data: list[Any], english_block: dict[str, Any]) -> list[dict
 
 
 def resolve_correct_answer(data: list[Any], english_block: dict[str, Any]) -> str:
+    """Read the answer field in the format Examside provides.
+
+    Some questions expose ``correct_options`` as a list, while others only have
+    a single ``answer`` field. We normalize both cases into one string.
+    """
+
     correct_options = resolve(data, english_block.get("correct_options", []))
     if isinstance(correct_options, list) and correct_options:
         resolved = [str(resolve(data, item)).strip() for item in correct_options]
@@ -213,6 +284,13 @@ def resolve_correct_answer(data: list[Any], english_block: dict[str, Any]) -> st
 
 
 def extract_batch_details(data: list[Any], question_refs: list[Any]) -> dict[str, dict[str, Any]]:
+    """Convert one detail payload into a map keyed by question id.
+
+    A single question-details page usually contains a batch of questions, not
+    just the question whose URL we visited. We take advantage of that to enrich
+    many questions at once.
+    """
+
     details: dict[str, dict[str, Any]] = {}
 
     for question_ref in question_refs:
@@ -234,6 +312,8 @@ def extract_batch_details(data: list[Any], question_refs: list[Any]) -> dict[str
 
         details[question_id] = {
             "chapter": slug_to_title(resolve_field(data, question, "chapter", "")),
+            # The Question model stores only up to four options, so we flatten the
+            # extracted options list into explicit option_a ... option_d fields.
             "option_a": options[0]["content"] if len(options) > 0 else "",
             "option_b": options[1]["content"] if len(options) > 1 else "",
             "option_c": options[2]["content"] if len(options) > 2 else "",
@@ -251,15 +331,17 @@ def extract_batch_details(data: list[Any], question_refs: list[Any]) -> dict[str
 
 
 def enrich_questions(paper_url: str, questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fetch detail pages and merge chapters/options/answers into each question."""
+
     question_map = {item["question_id"]: dict(item) for item in questions}
     processed_ids: set[str] = set()
 
     for question_id in list(question_map):
+        # Skip any question that was already covered by a previously fetched batch.
         if question_id in processed_ids:
             continue
 
         details_url = build_question_details_url(paper_url, question_id)
-        page_url = normalize_paper_url(paper_url)
         root = fetch_json(details_url, referer=details_url[: -len("/__data.json")])
         node = find_node(root, ["examGroup", "exam", "paper", "question"])
         data = node["data"]
@@ -276,6 +358,8 @@ def enrich_questions(paper_url: str, questions: list[dict[str, Any]]) -> list[di
     enriched_questions = []
     for item in questions:
         enriched = question_map[item["question_id"]]
+        # Some detail fields can be missing, so we make sure every DB column has
+        # a predictable default before creating Question objects.
         enriched.setdefault("chapter", "")
         enriched.setdefault("option_a", "")
         enriched.setdefault("option_b", "")
@@ -295,15 +379,24 @@ def enrich_questions(paper_url: str, questions: list[dict[str, Any]]) -> list[di
 
 
 def replace_paper_questions(paper_url: str) -> dict[str, Any]:
+    """Import the paper and replace the existing DB rows for the same slot.
+
+    Matching is currently done by ``exam_type + date + shift``. That means
+    re-importing a paper for the same date/shift deletes the old questions first
+    and then inserts the fresh set.
+    """
+
     metadata, base_questions = extract_paper_questions(paper_url)
     questions = enrich_questions(paper_url, base_questions)
 
+    # Keep only one imported paper per exam/date/shift combination.
     Question.objects.filter(
         exam_type=metadata.exam_type,
         date=metadata.exam_date,
         shift=metadata.shift,
     ).delete()
 
+    # Build Question model instances in memory, then insert them in batches.
     records = [
         Question(
             subject=item["subject"],
